@@ -93,7 +93,7 @@ jobs:
           CGO_ENABLED=1 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
             go build -trimpath -buildmode=c-shared \
               -ldflags "-s -w -X main.pluginVersion=${VERSION}" \
-              -o "dist/${LIB_NAME}" ./cmd/commandcode
+              -o "dist/${LIB_NAME}" .
           rm -f "dist/${PLUGIN_ID}.h"
 
       - name: Package plugin
