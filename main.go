@@ -1,0 +1,312 @@
+// Muse tools stripper — CLIProxyAPI request interceptor.
+//
+// Problem: codex clients (0.15x) send {"type":"additional_tools", ...} as
+// input[0] (exec sandbox tool declarations). The opencode zen free tier
+// (muse-spark-1.3-contributor-free, alias muse-free / muse) does not accept
+// this type and rejects the whole request with:
+//   400 [invalid_request_error] `input[0]` did not match any supported type
+// Verified live: same payload without the additional_tools entry returns 200.
+//
+// Fix: on the request.intercept_after hook, for zen free-tier models only,
+// drop input[] entries whose type is additional_tools. Standard entries
+// (message / function_call / function_call_output / reasoning / custom
+// tool calls) pass through untouched. exec sandbox is unavailable behind
+// this filter; conversation, file edits and shell calls are unaffected.
+package main
+
+/*
+#include <stdint.h>
+#include <stdlib.h>
+
+typedef struct {
+	void* ptr;
+	size_t len;
+} cliproxy_buffer;
+
+typedef int (*cliproxy_host_call_fn)(void*, const char*, const uint8_t*, size_t, cliproxy_buffer*);
+typedef void (*cliproxy_host_free_fn)(void*, size_t);
+
+typedef struct {
+	uint32_t abi_version;
+	void* host_ctx;
+	cliproxy_host_call_fn call;
+	cliproxy_host_free_fn free_buffer;
+} cliproxy_host_api;
+
+typedef int (*cliproxy_plugin_call_fn)(char*, uint8_t*, size_t, cliproxy_buffer*);
+typedef void (*cliproxy_plugin_free_fn)(void*, size_t);
+typedef void (*cliproxy_plugin_shutdown_fn)(void);
+
+typedef struct {
+	uint32_t abi_version;
+	cliproxy_plugin_call_fn call;
+	cliproxy_plugin_free_fn free_buffer;
+	cliproxy_plugin_shutdown_fn shutdown;
+} cliproxy_plugin_api;
+
+extern int cliproxyPluginCall(char*, uint8_t*, size_t, cliproxy_buffer*);
+extern void cliproxyPluginFree(void*, size_t);
+extern void cliproxyPluginShutdown(void);
+
+static const cliproxy_host_api* stored_host;
+
+static void store_host_api(const cliproxy_host_api* host) {
+	stored_host = host;
+}
+*/
+import "C"
+
+import (
+	"encoding/json"
+	"strings"
+	"unsafe"
+
+	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
+)
+
+const abiVersion uint32 = 1
+
+const (
+	pluginID      = "muse-tools-stripper"
+	pluginVersion = "0.1.0"
+)
+
+// zenFreeModels matches the opencode zen free-tier models behind the
+// muse-free / muse aliases. Matching is case-insensitive and ignores any
+// provider prefix; RequestedModel (client alias) and Model (upstream id)
+// are both checked.
+// NOTE: paid builds (muse-spark-1.3-contributor, muse-spark-contributor)
+// are deliberately ABSENT: they may support additional_tools, and must
+// never be filtered without evidence.
+var zenFreeModels = map[string]struct{}{
+	"muse-free":                       {},
+	"muse":                            {},
+	"muse-spark-free":                 {},
+	"muse-spark-1.3-contributor-free": {},
+	"muse-spark-contributor-free":     {},
+}
+
+// strippedTypes are input[] entry types the zen free tier rejects.
+var strippedTypes = map[string]struct{}{
+	"additional_tools": {},
+}
+
+type envelope struct {
+	OK     bool            `json:"ok"`
+	Result json.RawMessage `json:"result,omitempty"`
+	Error  *envelopeError  `json:"error,omitempty"`
+}
+
+type envelopeError struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+type registration struct {
+	SchemaVersion uint32       `json:"schema_version"`
+	Metadata      metadata     `json:"metadata"`
+	Capabilities  capabilities `json:"capabilities"`
+}
+
+type metadata struct {
+	Name             string `json:"Name"`
+	Version          string `json:"Version"`
+	Author           string `json:"Author"`
+	GitHubRepository string `json:"GitHubRepository"`
+	Logo             string `json:"Logo"`
+	ConfigFields     []any  `json:"ConfigFields"`
+}
+
+type capabilities struct {
+	RequestInterceptor bool `json:"request_interceptor"`
+}
+
+// interceptRequest mirrors pluginapi.RequestInterceptRequest (only the
+// fields we read).
+type interceptRequest struct {
+	SourceFormat   string            `json:"SourceFormat"`
+	ToFormat       string            `json:"ToFormat"`
+	Model          string            `json:"Model"`
+	RequestedModel string            `json:"RequestedModel"`
+	Stream         bool              `json:"Stream"`
+	Headers        map[string][]string `json:"Headers"`
+	Body           []byte            `json:"Body"`
+}
+
+// interceptResponse mirrors pluginapi.RequestInterceptResponse: Body
+// non-empty replaces the request payload.
+type interceptResponse struct {
+	Body []byte `json:"Body"`
+}
+
+func main() {}
+
+//export cliproxy_plugin_init
+func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_api) C.int {
+	if plugin == nil {
+		return 1
+	}
+	C.store_host_api(host)
+	plugin.abi_version = C.uint32_t(abiVersion)
+	plugin.call = C.cliproxy_plugin_call_fn(C.cliproxyPluginCall)
+	plugin.free_buffer = C.cliproxy_plugin_free_fn(C.cliproxyPluginFree)
+	plugin.shutdown = C.cliproxy_plugin_shutdown_fn(C.cliproxyPluginShutdown)
+	return 0
+}
+
+//export cliproxyPluginCall
+func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t, response *C.cliproxy_buffer) C.int {
+	if response != nil {
+		response.ptr = nil
+		response.len = 0
+	}
+	if method == nil {
+		writeResponse(response, errorEnvelope("invalid_method", "method is required"))
+		return 1
+	}
+	var payload []byte
+	if request != nil && requestLen > 0 {
+		payload = C.GoBytes(unsafe.Pointer(request), C.int(requestLen))
+	}
+	raw, errHandle := handleMethod(C.GoString(method), payload)
+	if errHandle != nil {
+		writeResponse(response, errorEnvelope("plugin_error", errHandle.Error()))
+		return 1
+	}
+	writeResponse(response, raw)
+	return 0
+}
+
+//export cliproxyPluginFree
+func cliproxyPluginFree(ptr unsafe.Pointer, len C.size_t) {
+	if ptr != nil {
+		C.free(ptr)
+	}
+	_ = len
+}
+
+//export cliproxyPluginShutdown
+func cliproxyPluginShutdown() {}
+
+func handleMethod(method string, payload []byte) ([]byte, error) {
+	switch method {
+	case "plugin.register", "plugin.reconfigure":
+		return okEnvelopeJSON(registration{
+			SchemaVersion: abiVersion,
+			Metadata: metadata{
+				Name:             pluginID,
+				Version:          pluginVersion,
+				Author:           "cpa-admin",
+				GitHubRepository: "https://github.com/ahoo/cpa-plugin-muse-tools-stripper",
+				Logo:             "",
+				ConfigFields:     []any{},
+			},
+			Capabilities: capabilities{RequestInterceptor: true},
+		})
+	case "request.intercept_before", "request.intercept_after":
+		return intercept(payload)
+	default:
+		// Never fail a request on unknown probes.
+		return okEnvelopeJSON(interceptResponse{})
+	}
+}
+
+func intercept(payload []byte) ([]byte, error) {
+	var req interceptRequest
+	if len(payload) > 0 {
+		if errDecode := json.Unmarshal(payload, &req); errDecode != nil {
+			return nil, errDecode
+		}
+	}
+	if len(req.Body) == 0 {
+		return okEnvelopeJSON(interceptResponse{})
+	}
+	if !isZenFree(req.RequestedModel) && !isZenFree(req.Model) {
+		return okEnvelopeJSON(interceptResponse{})
+	}
+	fixed, changed := stripUnsupportedInput(req.Body)
+	if !changed {
+		return okEnvelopeJSON(interceptResponse{})
+	}
+	return okEnvelopeJSON(interceptResponse{Body: fixed})
+}
+
+func isZenFree(model string) bool {
+	m := strings.ToLower(strings.TrimSpace(model))
+	if i := strings.LastIndex(m, "/"); i >= 0 {
+		m = m[i+1:]
+	}
+	if m == "" {
+		return false
+	}
+	if _, ok := zenFreeModels[m]; ok {
+		return true
+	}
+	// Suffix-tolerant for future free variants (muse-spark-1.4-...-free),
+	// but never match the paid contributor builds without a free marker:
+	// "muse-spark-1.3-contributor" must stay untouched.
+	if !strings.HasSuffix(m, "free") && !strings.HasSuffix(m, "free ") {
+		return false
+	}
+	return strings.HasPrefix(m, "muse")
+}
+
+// stripUnsupportedInput removes input[] entries with rejected types.
+// Returns the rewritten body and whether anything changed.
+func stripUnsupportedInput(body []byte) ([]byte, bool) {
+	if !gjson.ValidBytes(body) {
+		return body, false
+	}
+	input := gjson.GetBytes(body, "input")
+	if !input.IsArray() {
+		return body, false
+	}
+	keep := make([]json.RawMessage, 0, len(input.Array()))
+	changed := false
+	for _, item := range input.Array() {
+		t := strings.ToLower(strings.TrimSpace(item.Get("type").String()))
+		if _, drop := strippedTypes[t]; drop {
+			changed = true
+			continue
+		}
+		keep = append(keep, json.RawMessage(item.Raw))
+	}
+	if !changed {
+		return body, false
+	}
+	raw, err := json.Marshal(keep)
+	if err != nil {
+		return body, false
+	}
+	out, err := sjson.SetRawBytes(body, "input", raw)
+	if err != nil {
+		return body, false
+	}
+	return out, true
+}
+
+func okEnvelopeJSON(result any) ([]byte, error) {
+	raw, errMarshal := json.Marshal(result)
+	if errMarshal != nil {
+		return nil, errMarshal
+	}
+	return json.Marshal(envelope{OK: true, Result: json.RawMessage(raw)})
+}
+
+func errorEnvelope(code, message string) []byte {
+	raw, _ := json.Marshal(envelope{OK: false, Error: &envelopeError{Code: code, Message: message}})
+	return raw
+}
+
+func writeResponse(response *C.cliproxy_buffer, raw []byte) {
+	if response == nil || len(raw) == 0 {
+		return
+	}
+	ptr := C.CBytes(raw)
+	if ptr == nil {
+		return
+	}
+	response.ptr = ptr
+	response.len = C.size_t(len(raw))
+}
