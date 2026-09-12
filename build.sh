@@ -27,9 +27,9 @@ docker run --rm \
     go mod tidy
     go vet ./...
     go test ./...
-    go build -buildvcs=false -buildmode=c-shared -buildmode=c-shared -o /out/'"${PLUGIN_NAME}"'-v0.1.0.so .
+    go build -buildvcs=false -buildmode=c-shared -o /out/'"${PLUGIN_NAME}"'-v0.1.2.so .
     # c-shared also emits a header next to the .so; cliproxy does not need it.
-    rm -f /out/'"${PLUGIN_NAME}"'-v0.1.0.h
+    rm -f /out/'"${PLUGIN_NAME}"'-v0.1.2.h
   '
 
-echo "[build] ok: ${OUT_DIR}/${PLUGIN_NAME}-v0.1.0.so"
+echo "[build] ok: ${OUT_DIR}/${PLUGIN_NAME}-v0.1.2.so"
