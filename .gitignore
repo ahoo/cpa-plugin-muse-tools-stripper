@@ -1,2 +1,10 @@
-*.so
+*.dll
+*.dylib
 *.h
+*.so
+*.zip
+*.sha256
+checksums.txt
+dist/
+__pycache__/
+*.pyc

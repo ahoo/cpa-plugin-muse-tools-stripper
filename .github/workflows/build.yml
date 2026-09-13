@@ -3,14 +3,17 @@ name: Build
 on:
   pull_request:
   push:
+    branches:
+      - main
     tags:
       - 'v*'
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 env:
+  GOFLAGS: -mod=readonly
   PLUGIN_ID: muse-tools-stripper
 
 jobs:
@@ -27,11 +30,47 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Test
-        run: go test ./...
+      - name: Verify formatting, module, and release identity
+        run: |
+          set -euo pipefail
+          test -z "$(gofmt -l ./*.go ./.github/scripts/*.go)"
+          go mod verify
+          python3 - <<'PY'
+          import json
+          import re
+          from pathlib import Path
 
-      - name: Vet
-        run: go vet ./...
+          source = Path("main.go").read_text()
+          match = re.search(r'^var pluginVersion = "([^"]+)"$', source, re.MULTILINE)
+          if not match:
+              raise SystemExit("linker-settable pluginVersion not found")
+          registry = json.loads(Path("registry.json").read_text())
+          if registry.get("schema_version") != 1 or len(registry.get("plugins", [])) != 1:
+              raise SystemExit("registry must use schema 1 and contain exactly one plugin")
+          entry = registry["plugins"][0]
+          expected = {
+              "id": "muse-tools-stripper",
+              "name": "Muse Free-Tier Tools Stripper",
+              "author": "ahoo",
+              "repository": "https://github.com/ahoo/cpa-plugin-muse-tools-stripper",
+              "homepage": "https://github.com/ahoo/cpa-plugin-muse-tools-stripper",
+              "license": "MIT",
+          }
+          for key, value in expected.items():
+              if entry.get(key) != value:
+                  raise SystemExit(f"registry {key} mismatch: {entry.get(key)!r}")
+          if entry.get("version") != match.group(1):
+              raise SystemExit("source and registry versions differ")
+          PY
+
+      - name: Vet and test
+        run: |
+          set -euo pipefail
+          go vet ./...
+          go vet ./.github/scripts
+          go test ./...
+          go test ./.github/scripts
+          go test -race ./...
 
   build:
     name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
@@ -74,13 +113,22 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+
       - name: Resolve release metadata
         run: |
           set -euo pipefail
-          if [[ "${GITHUB_REF_TYPE}" == "tag" && "${GITHUB_REF_NAME}" == v* ]]; then
+          REGISTRY_VERSION="$(python -c 'import json; print(json.load(open("registry.json"))["plugins"][0]["version"])')"
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            [[ "${GITHUB_REF_NAME}" == v* ]]
             VERSION="${GITHUB_REF_NAME#v}"
+            [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+            test "${VERSION}" = "${REGISTRY_VERSION}"
           else
-            VERSION="0.0.0-dev"
+            VERSION="${REGISTRY_VERSION}-dev.${GITHUB_SHA:0:12}"
           fi
           echo "VERSION=${VERSION}" >> "${GITHUB_ENV}"
           echo "LIB_NAME=${PLUGIN_ID}.${{ matrix.ext }}" >> "${GITHUB_ENV}"
@@ -91,10 +139,13 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           CGO_ENABLED=1 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
-            go build -trimpath -buildmode=c-shared \
+            go build -trimpath -buildvcs=true -buildmode=c-shared \
               -ldflags "-s -w -X main.pluginVersion=${VERSION}" \
               -o "dist/${LIB_NAME}" .
           rm -f "dist/${PLUGIN_ID}.h"
+
+      - name: Verify registration, ABI guards, and behavior
+        run: python .github/scripts/verify-registration.py --library "dist/${LIB_NAME}" --version "${VERSION}"
 
       - name: Package plugin
         run: |
@@ -119,6 +170,8 @@ jobs:
     needs:
       - build
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
       - name: Download build artifacts
         uses: actions/download-artifact@v4
@@ -126,19 +179,46 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Publish GitHub release
+      - name: Verify and publish immutable release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          sort dist/*.sha256 > dist/checksums.txt
+          cat dist/*.sha256 | LC_ALL=C sort -k2 > dist/checksums.txt
+          (cd dist && sha256sum -c checksums.txt)
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import zipfile
+
+          version = os.environ["GITHUB_REF_NAME"].removeprefix("v")
+          expected = {
+              f"muse-tools-stripper_{version}_darwin_amd64.zip": "muse-tools-stripper.dylib",
+              f"muse-tools-stripper_{version}_darwin_arm64.zip": "muse-tools-stripper.dylib",
+              f"muse-tools-stripper_{version}_linux_amd64.zip": "muse-tools-stripper.so",
+              f"muse-tools-stripper_{version}_linux_arm64.zip": "muse-tools-stripper.so",
+              f"muse-tools-stripper_{version}_windows_amd64.zip": "muse-tools-stripper.dll",
+          }
+          archives = {path.name: path for path in pathlib.Path("dist").glob("*.zip")}
+          if set(archives) != set(expected):
+              raise SystemExit(f"unexpected archives: {sorted(archives)}")
+          for name, root in expected.items():
+              with zipfile.ZipFile(archives[name]) as bundle:
+                  if bundle.namelist() != [root]:
+                      raise SystemExit(f"unexpected archive layout: {name}: {bundle.namelist()}")
+                  info = bundle.infolist()[0]
+                  if info.date_time != (1980, 1, 1, 0, 0, 0):
+                      raise SystemExit(f"non-deterministic timestamp: {name}: {info.date_time}")
+                  if (info.external_attr >> 16) & 0o777 != 0o755:
+                      raise SystemExit(f"unexpected root mode: {name}")
+          PY
           if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-            gh release upload "${GITHUB_REF_NAME}" dist/*.zip dist/checksums.txt --clobber --repo "${GITHUB_REPOSITORY}"
-          else
-            gh release create "${GITHUB_REF_NAME}" dist/*.zip dist/checksums.txt \
-              --repo "${GITHUB_REPOSITORY}" \
-              --verify-tag \
-              --title "${GITHUB_REF_NAME}" \
-              --notes "Automated release for ${GITHUB_REF_NAME}."
+            echo "release ${GITHUB_REF_NAME} already exists; refusing to replace assets" >&2
+            exit 1
           fi
+          gh release create "${GITHUB_REF_NAME}" dist/*.zip dist/checksums.txt \
+            --repo "${GITHUB_REPOSITORY}" \
+            --verify-tag \
+            --title "${GITHUB_REF_NAME}" \
+            --notes "Automated immutable release for ${GITHUB_REF_NAME}."

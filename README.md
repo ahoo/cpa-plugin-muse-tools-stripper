@@ -1,30 +1,48 @@
 # cpa-plugin-muse-tools-stripper
 
-CLIProxyAPI request interceptor for Codex clients on the opencode zen free
-tier (`muse-spark-1.3-contributor-free`, aliases `muse-free` / `muse`).
+A narrowly scoped CLIProxyAPI compatibility plugin for Codex Responses traffic sent to OpenCode Zen Muse free-tier models (`muse-spark-1.3-contributor-free`, including the `muse-free` and `muse` aliases).
 
-Codex 0.15x sends `{"type": "additional_tools", ...}` as `input[0]` (exec
-sandbox tool declarations). The zen free tier does not accept this input
-type and rejects the whole request with:
+Codex clients can send an `input[]` entry shaped like this:
+
+```json
+{"type": "additional_tools", "tools": []}
+```
+
+The Muse free tier currently rejects that entry with:
 
 ```text
 400 [invalid_request_error] `input[0]` did not match any supported type
 ```
 
-Verified live: the same payload without the `additional_tools` entry
-returns 200. This plugin drops `input[]` entries of type
-`additional_tools` for free-tier models only, on the
-`request.intercept_after` hook. Standard entries (`message`,
-`function_call`, `function_call_output`, `reasoning`, custom tool calls)
-pass through untouched.
+The plugin removes only `input[]` entries whose type is `additional_tools`. It preserves messages, function calls and outputs, reasoning items, custom tool calls, and every other input type.
 
-Trade-off: the `exec` sandbox tool is unavailable behind this filter;
-conversation, file edits and shell calls are unaffected.
+## Scope and trade-off
 
-Paid builds (`muse-spark-1.3-contributor` without a free marker) are
-deliberately never filtered — they may support the type.
+Filtering is intentionally fail-closed by target identity and fail-open by payload:
+
+- Muse/OpenCode Zen aliases with a `-free` identity are eligible.
+- Paid Muse contributor models without the free marker are never changed.
+- Unrelated models and traffic targeting non-Codex formats are never changed.
+- Missing, malformed, or non-Responses inner payloads pass through unchanged.
+- Thinking suffixes such as `muse-free(high)` and provider-prefixed aliases are recognized.
+- Running both interception and normalization is idempotent.
+
+The filtered `additional_tools` declaration represents the Codex exec-sandbox capability, so that capability is unavailable behind this workaround. Conversation, ordinary function tools, file edits, and shell calls represented by supported input types are unaffected.
+
+## Hooks
+
+The plugin registers both request-interceptor and request-normalizer capabilities:
+
+1. `request.intercept_before` and `request.intercept_after` handle requests that already contain a Codex `input[]` payload before or after credential selection.
+2. `request.normalize` handles provider payloads after CLIProxyAPI translation when the translator itself generated `input[]`.
+
+Using all three hooks covers the supported request paths without modifying CLIProxyAPI itself.
 
 ## Install
+
+After the plugin is accepted into the official CLIProxyAPI Plugins Store, install `muse-tools-stripper` through the host's plugin-management UI. For a manual installation, download the archive for the host platform from the matching GitHub Release, verify it against `checksums.txt`, extract the single library at the plugin-directory root, enable the plugin, and restart CLIProxyAPI so the Go shared library is loaded.
+
+Example configuration:
 
 ```yaml
 plugins:
@@ -35,33 +53,46 @@ plugins:
       priority: 50
 ```
 
-Restart and verify:
-
-```bash
-docker restart cli-proxy-api
-docker logs cli-proxy-api | grep muse-tools-stripper
-# pluginhost: plugin registered plugin_id=muse-tools-stripper ...
-```
-
-## Upstream note
-
-Workaround for a backend capability gap, not a host bug. **Not submitted
-to the official plugin store** — narrow, backend-specific, tracked for
-removal if the zen tier accepts the type.
+A successful startup registers both capabilities under the exact ID `muse-tools-stripper`.
 
 ## Build
 
-Debian/glibc toolchain only:
+The local build uses a pinned Debian/glibc Go image, mounts the source read-only, runs formatting/module/vet/test/race gates, and writes only to repository-local staging by default:
 
 ```bash
 ./build.sh
+# dist/local/linux_amd64/muse-tools-stripper-v0.1.3.so
 ```
 
-## Test
+Override the staging directory with `PLUGIN_OUT_DIR`. Do not point it at a live plugin mount; validate the staged artifact before deployment.
+
+For direct source checks:
 
 ```bash
-go vet ./... && go test ./...
+test -z "$(gofmt -l ./*.go ./.github/scripts/*.go)"
+go mod verify
+go vet ./...
+go vet ./.github/scripts
+go test ./...
+go test ./.github/scripts
+go test -race ./...
 ```
+
+## Releases
+
+Tags build five native archives:
+
+```text
+muse-tools-stripper_<version>_<goos>_<goarch>.zip
+```
+
+Each ZIP has exactly one canonical root library (`muse-tools-stripper.so`, `.dylib`, or `.dll`), fixed metadata for reproducibility, and an entry in `checksums.txt`. The workflow refuses to overwrite an existing GitHub Release.
+
+A distinct local binary already used version `0.1.2` before release hardening, so the hardened immutable release is `v0.1.3`; no published version is reused or replaced.
+
+## Removal
+
+This is a backend capability workaround. Remove or disable the plugin once the Muse free tier accepts `additional_tools` natively, after validating equivalent requests without the filter.
 
 ## License
 
