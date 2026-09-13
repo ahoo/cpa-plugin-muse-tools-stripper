@@ -266,13 +266,42 @@ func TestRegisterCapabilities(t *testing.T) {
 	if err := json.Unmarshal(env.Result, &reg); err != nil {
 		t.Fatal(err)
 	}
+	if reg.SchemaVersion != abiVersion {
+		t.Errorf("schema version = %d, want %d", reg.SchemaVersion, abiVersion)
+	}
 	if !reg.Capabilities.RequestInterceptor {
 		t.Errorf("request_interceptor = false, want true")
 	}
 	if !reg.Capabilities.RequestNormalizer {
 		t.Errorf("request_normalizer = false, want true")
 	}
-	if reg.Metadata.Version != pluginVersion {
-		t.Errorf("metadata version = %q, want %q", reg.Metadata.Version, pluginVersion)
+	if reg.Metadata.Name != pluginID ||
+		reg.Metadata.Version != pluginVersion ||
+		reg.Metadata.Author != "ahoo" ||
+		reg.Metadata.GitHubRepository != "https://github.com/ahoo/cpa-plugin-muse-tools-stripper" {
+		t.Errorf("metadata = %+v, want current release identity", reg.Metadata)
+	}
+}
+
+func TestRequestLengthSupported(t *testing.T) {
+	if !requestLengthSupported(maxCGoBytesLength) {
+		t.Fatal("maximum C.GoBytes request length should be accepted")
+	}
+	if requestLengthSupported(maxCGoBytesLength + 1) {
+		t.Fatal("oversized request length should be rejected")
+	}
+}
+
+func TestProcessPluginCallReturnsFailureEnvelope(t *testing.T) {
+	raw, status := processPluginCall("request.normalize", []byte(`{"Body":`))
+	if status != 1 {
+		t.Fatalf("status = %d, want 1", status)
+	}
+	var env envelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		t.Fatal(err)
+	}
+	if env.OK || env.Error == nil || env.Error.Code != "plugin_error" {
+		t.Fatalf("envelope = %+v, want plugin_error", env)
 	}
 }

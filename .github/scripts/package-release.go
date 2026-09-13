@@ -2,6 +2,7 @@ package main
 
 import (
 	"archive/zip"
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"flag"
@@ -9,7 +10,12 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"time"
 )
+
+const pluginID = "muse-tools-stripper"
+
+var archiveEpoch = time.Date(1980, time.January, 1, 0, 0, 0, 0, time.UTC)
 
 func main() {
 	libraryPath := flag.String("library", "", "path to the compiled plugin library")
@@ -36,37 +42,29 @@ func packageLibrary(libraryPath, archivePath string) ([]byte, error) {
 	if errOpen != nil {
 		return nil, fmt.Errorf("open library: %w", errOpen)
 	}
-	defer func() {
-		if errClose := library.Close(); errClose != nil {
-			fmt.Fprintf(os.Stderr, "close library: %v\n", errClose)
-		}
-	}()
+	defer library.Close()
 
 	info, errStat := library.Stat()
 	if errStat != nil {
 		return nil, fmt.Errorf("stat library: %w", errStat)
 	}
-	archive, errCreate := os.Create(archivePath)
-	if errCreate != nil {
-		return nil, fmt.Errorf("create archive: %w", errCreate)
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("library is not a regular file")
 	}
-	archiveClosed := false
-	defer func() {
-		if !archiveClosed {
-			if errClose := archive.Close(); errClose != nil {
-				fmt.Fprintf(os.Stderr, "close archive: %v\n", errClose)
-			}
-		}
-	}()
 
-	writer := zip.NewWriter(archive)
-	header, errHeader := zip.FileInfoHeader(info)
-	if errHeader != nil {
-		return nil, fmt.Errorf("create zip header: %w", errHeader)
+	entryName, errName := archiveEntryName(libraryPath)
+	if errName != nil {
+		return nil, errName
 	}
-	header.Name = filepath.Base(libraryPath)
-	header.Method = zip.Deflate
+
+	var archive bytes.Buffer
+	writer := zip.NewWriter(&archive)
+	header := &zip.FileHeader{
+		Name:   entryName,
+		Method: zip.Deflate,
+	}
 	header.SetMode(0o755)
+	header.SetModTime(archiveEpoch)
 	entry, errEntry := writer.CreateHeader(header)
 	if errEntry != nil {
 		return nil, fmt.Errorf("create zip entry: %w", errEntry)
@@ -77,16 +75,22 @@ func packageLibrary(libraryPath, archivePath string) ([]byte, error) {
 	if errClose := writer.Close(); errClose != nil {
 		return nil, fmt.Errorf("close zip writer: %w", errClose)
 	}
-	if errClose := archive.Close(); errClose != nil {
-		return nil, fmt.Errorf("close archive: %w", errClose)
-	}
-	archiveClosed = true
 
-	data, errRead := os.ReadFile(archivePath)
-	if errRead != nil {
-		return nil, fmt.Errorf("read archive: %w", errRead)
+	data := archive.Bytes()
+	if errWrite := os.WriteFile(archivePath, data, 0o644); errWrite != nil {
+		return nil, fmt.Errorf("write archive: %w", errWrite)
 	}
 	return data, nil
+}
+
+func archiveEntryName(libraryPath string) (string, error) {
+	extension := filepath.Ext(libraryPath)
+	switch extension {
+	case ".so", ".dylib", ".dll":
+		return pluginID + extension, nil
+	default:
+		return "", fmt.Errorf("unsupported plugin library extension: %q", extension)
+	}
 }
 
 func fatalf(format string, args ...any) {
